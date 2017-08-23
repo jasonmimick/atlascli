@@ -6,7 +6,7 @@
 __version__ = "0.0.1"
 
 import logging, argparse, sys, os, requests, urllib
-import traceback, json
+import traceback, json, re
 from requests.auth import HTTPDigestAuth
 
 class App():
@@ -23,19 +23,25 @@ class App():
                 '/' : 'get'
                 ,'/databaseUsers' : 'get'
                 ,'/databaseUsers/admin/' : 'patch'
+                ,'/alerts' : 'get'
+                ,'/clusters' : 'get'
+                ,'/clusters/.*/logs/mongodb.gz' : 'get'
         }
         self.command_map = {
                 'CHANGEMONGODBUSERPASSWORD' : 'change_mongodb_user_password'
+                ,'ALERTS' : 'alerts'
+                ,'CLUSTERS' : 'clusters'
+                ,'LOGS' : 'logs'
         }
         self.logger.debug('app.args.endpoint: %s' % self.args.endpoint)
         ep = self.args.endpoint
         # slice out query string, if any
         self.ep_no_query = ep[0:ep.find('?') if (ep.find('?')>-1) else len(ep)]
-
+        self.logger.debug('ep_no_query: %s' % self.ep_no_query)
         # determine if command mode or just arbitrary endpoint
         self.command_mode = False
         if len(self.args.command_info)==0:
-            if not ep_no_query in self.endpoint_map:
+            if not self.ep_in_endpoint_map(self.ep_no_query):
                 raise Exception('unsupported endpoint: %s' % self.__ep__())
         else:
             self.command_mode = True
@@ -61,6 +67,17 @@ class App():
         if self.command_mode:
             self.data = json.dumps(self.command_args)
 
+    def ep_in_endpoint_map(self,ep):
+        result = False;
+        map_ep = ''
+        for e in self.endpoint_map:
+            match = re.match(e,ep)
+            if match:
+                result = True
+                map_ep = e
+                break
+        self.logger.debug('ep_in_endpoint_map ep=%s result=%s' % (ep,result))
+        return (result, map_ep)
 
     def invoke(self):
         # Run a command if given, otherwise default to generic endpoint
@@ -68,7 +85,8 @@ class App():
             method_name = self.command_map[self.command_name]
 
         else:
-            method_name = self.endpoint_map[self.ep_no_query]
+            (junk, map_entry) = self.ep_in_endpoint_map(self.ep_no_query)
+            method_name = self.endpoint_map[map_entry]
 
         method = getattr(self,method_name)
         return method()
@@ -79,6 +97,8 @@ class App():
     def __ep__(self,__ep=None):
         ep = 'https://cloud.mongodb.com/api/atlas/v1.0/groups/%s' % self.args.project
         ep = '%s%s' % (ep, self.args.endpoint if (__ep is None) else __ep)
+        if self.args.pretty:
+            ep = '%s?pretty=true' % ep
         self.logger.debug('endpoint: %s' % ep)
         return ep
 
@@ -89,6 +109,21 @@ class App():
                 missing_args.append(arg)
         if len(missing_args)>0:
             raise Exception("missing required argument(s): %s" % ', '.join(missing_args))
+
+    def alerts(self):
+        self.logger.debug("alerts called")
+        ep = self.__ep__('/alerts')
+        return self.get(ep)
+
+    def clusters(self):
+        self.logger.debug("clusters called")
+        ep = self.__ep__('/clusters')
+        return self.get(ep)
+
+    def logs(self):
+        self.logger.debug("logs called")
+        ep = self.__ep__('/clusters/%s/logs/mongodb.gz' % self.command_args['hostname'])
+        return self.get(ep)
 
     def change_mongodb_user_password(self):
         self.logger.debug("change_mongodb_user_password called")
@@ -102,7 +137,11 @@ class App():
             url = self.__ep__()
         self.logger.debug('get() GET: %s' % url)
         response= requests.get(url,auth=self.__http_auth__())
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except Exception as exp:
+            self.logger.error(json.dumps(response.json()))
+            raise exp
         self.logger.debug('get() response: %s' % response)
         return response
 
@@ -128,15 +167,25 @@ class App():
 def main():
     # parse arguments
     description = u'atlascli - Command Line Interface to MongoDB Atlas API'
-    parser = argparse.ArgumentParser(description=description)
+    epilog = ('''atlascli can call an arbitray MongoDB Atlas API endpoint by specifing the url or supports a command mode syntax. The supported commands are:
+    - changeMongoDBUserPassword username:<username> password:<password>
+    - alerts
+    - clusters
+    - logsForHost host:<host>
+Consult https://docs.atlas.mongodb.com/api/ for full details on command arguments.''')
+    parser = argparse.ArgumentParser(description=description,epilog=epilog
+                                     ,formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--version",action='store_true',default=False,help='print version and exit')
+    parser.add_argument("--pretty",action='store_true',default=False,help='pretty format JSON')
     parser.add_argument("--loglevel",default='error'
                          ,help='loglevel debug,info default=info')
     parser.add_argument("--logfile",default='--',help='logfile full path or -- for stdout')
     parser.add_argument("--atlasuser",help='Atlas user which has access to Atlas API')
     parser.add_argument("--apikey",help='API key for Atlas user')
     parser.add_argument('--project',help='Atlas Project Id')
-    parser.add_argument("command_info",nargs="*")
+    parser.add_argument("command_info",nargs="*",help='format: command key1:value1 key2:value2 key3:value3 '
+                        + '... \na supported command followed by command inputs'
+                        + '')
     parser.add_argument('--endpoint',help='Atlas API Endpoint')
     parser.add_argument('--data',help='Data to send, use @<filename> to read data from file.')
 
@@ -171,7 +220,10 @@ def main():
     try:
         logger.info('running...')
         result = app.invoke()
-        print(result.json())
+        if args.pretty:
+            print(json.dumps(result.json(), indent=2))
+        else:
+            print(json.dumps(result.json()))
         logger.info('atlascli done')
         os._exit(0)
     except Exception as exp:
